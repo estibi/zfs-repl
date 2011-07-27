@@ -1,0 +1,185 @@
+#! /bin/sh
+#
+# AUTHOR: Piotr Jasiukajtis / estibi
+# 
+# VERSION: 0.1
+
+DEST_HOST="remote-hostname"
+DEST_USER="remote-user"
+
+REPL_FS="my-dataset"
+
+LATEST_SNAPSHOT=""
+CUR_DATE=""
+TMP_DUMP=""
+
+DEBUG=0
+
+
+ZFS_SNAPSHOT="pfexec /usr/sbin/zfs snapshot"
+ZFS_SEND="pfexec /usr/sbin/zfs send"
+ZFS_RECEIVE="pfexec /usr/sbin/zfs receive"
+ZFS_LIST="pfexec /usr/sbin/zfs list"
+ZFS_ROLLBACK="pfexec /usr/sbin/zfs rollback"
+ZFS_DESTROY="pfexec /usr/sbin/zfs destroy"
+
+##############################################################
+er_dataset()
+{
+	echo "Can't find ${REPL_FS}!"
+	exit 2
+}
+
+
+check_error()
+{
+	if [ ${1} = 1 ]; then
+		echo "Error, exiting"
+		exit 1
+	fi
+}
+
+ 
+get_cur_date()
+{
+	CUR_DATE=`date '+%y%m%d_%H-%M-%S'`
+	check_error ${?}
+}
+
+
+set_tmp_dump()
+{
+	TMP_DUMP="${HOME}/inc_snap_${CUR_DATE}.zfs"
+}
+
+
+do_snapshot()
+{
+	echo "Creating snapshot ..."
+	if [ ${DEBUG} = "1" ]; then
+		echo "${ZFS_SNAPSHOT} ${REPL_FS}@backup_${CUR_DATE}"
+	fi
+	${ZFS_SNAPSHOT} ${REPL_FS}@backup_${CUR_DATE}
+	check_error ${?}
+}
+
+
+do_send()
+{
+	if [ ${DEBUG} = "1" ]; then
+		echo "rm -f ${TMP_DUMP}"
+	fi
+	rm -f "${TMP_DUMP}"
+
+	echo "Creating incremental snapshot ..."
+	if [ ${DEBUG} = "1" ]; then
+		echo "${ZFS_SEND} -i ${LATEST_REMOTE_SNAPSHOT} ${REPL_FS}@backup_${CUR_DATE} > ${TMP_DUMP}"
+	fi
+	${ZFS_SEND} -i "${LATEST_REMOTE_SNAPSHOT}" "${REPL_FS}@backup_${CUR_DATE}" > ${TMP_DUMP}
+	check_error ${?}
+}
+
+
+get_latest_remote_version()
+{
+	echo "Checking remote snapshots ..."
+	COUNT=1
+	while [ ${COUNT} -le 100 ]
+	do
+	#echo "DEBUG: COUNT=${COUNT}"
+	LATEST_REMOTE_SNAPSHOT="`ssh ${DEST_USER}@${DEST_HOST} ${ZFS_LIST} \
+		-r -H -o name -t snapshot ${REPL_FS} | sed '/\:/d' | tail -${COUNT} | head -1`"
+	if [ "${LATEST_REMOTE_SNAPSHOT}" = "no datasets available" ]; then
+		echo "No remote datasets available ..." 
+		exit 2
+	fi
+	echo "Trying Latest remote snapshot: ${LATEST_REMOTE_SNAPSHOT}"
+	if [ ${DEBUG} = "1" ]; then
+		echo "${ZFS_LIST} -H -o name -t snapshot -r ${REPL_FS} | grep ${LATEST_REMOTE_SNAPSHOT}"
+	fi
+	${ZFS_LIST} -H -o name -t snapshot -r ${REPL_FS} | grep ${LATEST_REMOTE_SNAPSHOT}
+	if [ ${?} = 1 ]; then
+		COUNT=`expr ${COUNT} + 1`
+	else
+		echo "Restoring remote ${REPL_FS} ..."
+		if [ ${DEBUG} = "1" ]; then
+			echo "ssh ${DEST_USER}@${DEST_HOST} ${ZFS_ROLLBACK} -r ${LATEST_REMOTE_SNAPSHOT}"
+		fi
+		ssh "${DEST_USER}@${DEST_HOST}" "${ZFS_ROLLBACK}" -r "${LATEST_REMOTE_SNAPSHOT}"
+		check_error ${?}
+		break	
+	fi
+	done
+
+	${ZFS_LIST} -H -o name -t snapshot -r ${REPL_FS} | grep ${LATEST_REMOTE_SNAPSHOT} > /dev/null
+	if [ ${?} = 1 ]; then
+		echo "Can't find suitable snapshots!"
+		exit 1
+	fi
+	echo "Latest remote snapshot: ${LATEST_REMOTE_SNAPSHOT}"
+}
+
+
+do_copy_inc_snapshot()
+{
+	echo "Sending snapshot to host ${DEST_HOST} ..."
+	if [ ${DEBUG} = "1" ]; then
+		echo "scp ${TMP_DUMP} ${DEST_USER}@${DEST_HOST}:"
+	fi
+	scp ${TMP_DUMP} ${DEST_USER}@${DEST_HOST}:
+	check_error ${?}
+}
+
+
+do_remote_receive()
+{
+	echo "Receiving snapshot ..."
+	if [ ${DEBUG} = "1" ]; then
+		echo "ssh ${DEST_USER}@${DEST_HOST} ${ZFS_RECEIVE} -Fv ${REPL_FS} < ${TMP_DUMP}"
+	fi
+	ssh ${DEST_USER}@${DEST_HOST} ${ZFS_RECEIVE} -Fv ${REPL_FS} < ${TMP_DUMP}
+	check_error ${?}
+}
+
+
+delete_tmp_dump()
+{
+	echo "Deleting temporary files ..."
+	if [ ${DEBUG} = "1" ]; then
+		echo "rm -f ${TMP_DUMP}"
+	fi
+	rm -f ${TMP_DUMP}
+	if [ ${DEBUG} = "1" ]; then
+		echo "ssh ${DEST_USER}@${DEST_HOST} rm -r ${TMP_DUMP}"
+	fi
+	ssh ${DEST_USER}@${DEST_HOST} rm -r ${TMP_DUMP}
+}
+
+
+##############################################################
+# ${1} - config file
+if [ ${#} != "1" ]; then
+	echo "Usage: zfs-repl ./config_file.cfg"
+	exit 2
+fi
+
+echo "Using config file: ${1}"
+. "${1}"
+
+echo "Used filesystem: ${REPL_FS}"
+
+# Check dataset 
+${ZFS_LIST} ${REPL_FS} || er_dataset
+echo
+
+
+get_latest_remote_version && \
+get_cur_date && \
+set_tmp_dump && \
+do_snapshot && do_send && \
+do_copy_inc_snapshot && \
+do_remote_receive && \
+delete_tmp_dump && \
+echo "OK, done"
+
+# EOF
